@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A Telegram bot built with aiogram 3.x that transforms user photos into AI-generated images (FAL nano-banana) and videos (FAL WAN 2.5). Single-file architecture in bot.py (~495 lines), minimalist design with no over-engineering.
+A Telegram bot built with aiogram 3.x that transforms user photos into AI-generated images (FAL nano-banana) and videos (KIE AI Grok Imagine). Single-file architecture in bot.py (~530 lines), minimalist design with no over-engineering.
 
 ## Development Commands
 
@@ -23,6 +23,7 @@ Create/edit `.env` file with:
 ```
 BOT_TOKEN=your_telegram_bot_token
 FAL_KEY=your_fal_api_key
+KIE_API_KEY=your_kie_api_key
 ```
 
 ## Architecture & Key Patterns
@@ -74,29 +75,49 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ```
 
-## FAL.ai API Integration
+## API Integration
 
-### Image Generation (nano-banana)
+### Image Generation (FAL nano-banana)
 Model: `fal-ai/nano-banana/edit`
+
+Method: Synchronous FAL client wrapped in `asyncio.to_thread()`
 
 Arguments:
 - `prompt`: str - Image editing prompt
 - `num_images`: int - Number of images to generate
-- `image_urls`: list[str] - Uploaded image URLs
+- `image_urls`: list[str] - Uploaded image URLs (via `fal_client.upload_file()`)
 - `output_format`: "png"
 
 Returns: `{"images": [{"url": str, ...}], ...}`
 
-### Video Generation (WAN 2.5)
-Model: `fal-ai/wan-25-preview/image-to-video`
+### Video Generation (KIE AI Grok Imagine)
+Model: `grok-imagine/image-to-video`
 
-Arguments:
-- `prompt`: str - Motion description (max 800 chars)
-- `image_url`: str - First frame image URL
-- `resolution`: "1080p"
-- `duration`: "5"
+Method: Async HTTP requests with polling
 
-Returns: `{"video": {"url": str, ...}, ...}`
+**Create Task:**
+- Endpoint: `POST https://api.kie.ai/api/v1/jobs/createTask`
+- Headers: `Authorization: Bearer {KIE_API_KEY}`
+- Payload:
+  ```json
+  {
+    "model": "grok-imagine/image-to-video",
+    "input": {
+      "image_urls": ["https://..."],
+      "prompt": "motion description",
+      "mode": "normal"
+    }
+  }
+  ```
+- Response: `{"code": 200, "data": {"taskId": "..."}}`
+
+**Poll Task Status:**
+- Endpoint: `GET https://api.kie.ai/api/v1/jobs/queryTask/{taskId}`
+- Poll every 5 seconds, max 120 attempts (10 minutes)
+- Check `data.state`:
+  - `"success"` → parse `data.resultJson` (JSON string) to get `resultUrls[0]`
+  - `"fail"` → raise error with `data.failMsg`
+  - Other → continue polling (task processing)
 
 ## Workflow Pattern
 
@@ -114,9 +135,10 @@ Returns: `{"video": {"url": str, ...}, ...}`
 7. User selects number of videos per image
 8. User writes video prompts
 9. Bot generates videos:
-   - Uploads images to FAL
-   - Calls WAN 2.5 API
-   - Streams videos to user one-by-one
+   - Uploads images to FAL (to get public URLs)
+   - Creates KIE AI task with image URL
+   - Polls task status until completion
+   - Downloads and streams videos to user one-by-one
 
 ## Common Patterns
 
@@ -176,3 +198,6 @@ async def receive_photo(message: Message, state: FSMContext):
 - Videos are sent individually as they're generated (streaming pattern)
 - All errors send user-friendly messages and clear state
 - No persistent storage - all data in FSM MemoryStorage
+- Image uploads use FAL's `upload_file()` which returns public URLs for both FAL and KIE APIs
+- KIE API responses: create task uses `"message"` field, query task uses `"msg"` field
+- KIE API `resultJson` field is returned as JSON string and must be parsed with `json.loads()`

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import zipfile
 from io import BytesIO
@@ -19,11 +20,14 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 FAL_KEY = os.getenv("FAL_KEY")
+KIE_API_KEY = os.getenv("KIE_API_KEY")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable not set")
 if not FAL_KEY:
     raise ValueError("FAL_KEY environment variable not set")
+if not KIE_API_KEY:
+    raise ValueError("KIE_API_KEY environment variable not set")
 
 # ================== FSM States ==================
 class BotStates(StatesGroup):
@@ -415,7 +419,7 @@ async def receive_video_prompt(message: Message, state: FSMContext):
 
 # ================== Video Generation ==================
 async def generate_videos(message: Message, state: FSMContext):
-    """Generate videos using fal-ai wan 2.5"""
+    """Generate videos using KIE AI Grok Imagine"""
     data = await state.get_data()
     generated_images = data.get("generated_images", [])
     num_videos_per_image = data.get("num_videos_per_image", 1)
@@ -427,46 +431,85 @@ async def generate_videos(message: Message, state: FSMContext):
     try:
         prompt_idx = 0
 
-        for img_idx, (filename, img_data) in enumerate(generated_images):
-            # Save image temporarily
-            img_path = temp_dir / filename
-            with open(img_path, 'wb') as f:
-                f.write(img_data)
+        async with aiohttp.ClientSession() as session:
+            for img_idx, (filename, img_data) in enumerate(generated_images):
+                # Save image temporarily
+                img_path = temp_dir / filename
+                with open(img_path, 'wb') as f:
+                    f.write(img_data)
 
-            # Upload to FAL
-            image_url = fal_client.upload_file(str(img_path))
+                # Upload to FAL to get URL (KIE accepts external image URLs)
+                image_url = fal_client.upload_file(str(img_path))
 
-            for vid_idx in range(num_videos_per_image):
-                prompt = video_prompts[prompt_idx]
-                prompt_idx += 1
+                for vid_idx in range(num_videos_per_image):
+                    prompt = video_prompts[prompt_idx]
+                    prompt_idx += 1
 
-                await message.answer(
-                    f"🎬 Generating video {prompt_idx}/{len(video_prompts)}...\n"
-                    f"Image: {filename}\n"
-                    f"Prompt: {prompt[:50]}..."
-                )
-
-                # Generate video using wan 2.5
-                result = await asyncio.to_thread(
-                    fal_client.subscribe,
-                    "fal-ai/wan-25-preview/image-to-video",
-                    arguments={
-                        "prompt": prompt,
-                        "image_url": image_url,
-                        "resolution": "1080p",
-                        "duration": "5"
-                    },
-                    with_logs=False
-                )
-
-                # Download and send video
-                video_url = result.get("video", {}).get("url")
-                if video_url:
-                    video_data = await download_file(video_url)
-                    await message.answer_video(
-                        video=BufferedInputFile(video_data, filename=f"video_{img_idx}_{vid_idx}.mp4"),
-                        caption=f"✨ Video {prompt_idx}/{len(video_prompts)}\n\n📝 Prompt: {prompt}"
+                    await message.answer(
+                        f"🎬 Generating video {prompt_idx}/{len(video_prompts)}...\n"
+                        f"Image: {filename}\n"
+                        f"Prompt: {prompt[:50]}..."
                     )
+
+                    # Create video task using KIE AI Grok Imagine
+                    create_url = "https://api.kie.ai/api/v1/jobs/createTask"
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {KIE_API_KEY}"
+                    }
+                    payload = {
+                        "model": "grok-imagine/image-to-video",
+                        "input": {
+                            "image_urls": [image_url],
+                            "prompt": prompt,
+                            "mode": "normal"
+                        }
+                    }
+
+                    async with session.post(create_url, headers=headers, json=payload) as response:
+                        result = await response.json()
+                        if result.get("code") != 200:
+                            raise Exception(f"Failed to create task: {result.get('message')}")
+                        task_id = result.get("data", {}).get("taskId")
+
+                    # Poll for completion
+                    query_url = f"https://api.kie.ai/api/v1/jobs/queryTask/{task_id}"
+                    max_attempts = 120  # 10 minutes with 5 second intervals
+                    attempt = 0
+                    video_url = None
+
+                    while attempt < max_attempts:
+                        await asyncio.sleep(5)
+                        async with session.get(query_url, headers=headers) as response:
+                            task_result = await response.json()
+
+                            task_data = task_result.get("data", {})
+                            state_value = task_data.get("state")
+
+                            if state_value == "success":
+                                # Get video URL from result
+                                result_json = task_data.get("resultJson")
+                                if isinstance(result_json, str):
+                                    result_json = json.loads(result_json)
+                                video_url = result_json.get("resultUrls", [])[0]
+                                break
+                            elif state_value == "fail":
+                                fail_msg = task_data.get("failMsg", "Unknown error")
+                                raise Exception(f"Video generation failed: {fail_msg}")
+                            # If state is not success or fail, continue polling (task is processing)
+
+                        attempt += 1
+
+                    if attempt >= max_attempts:
+                        raise Exception("Video generation timed out")
+
+                    # Download and send video
+                    if video_url:
+                        video_data = await download_file(video_url)
+                        await message.answer_video(
+                            video=BufferedInputFile(video_data, filename=f"video_{img_idx}_{vid_idx}.mp4"),
+                            caption=f"✨ Video {prompt_idx}/{len(video_prompts)}\n\n📝 Prompt: {prompt}"
+                        )
 
         await message.answer(
             "🎉 <b>All videos generated successfully!</b>\n\n"
