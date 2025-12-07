@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import zipfile
 from io import BytesIO
@@ -12,6 +13,21 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, BufferedInputFile
 from dotenv import load_dotenv
+import logging
+from logging.handlers import RotatingFileHandler
+
+logger = logging.getLogger("videogenericbot")
+logger.setLevel(logging.DEBUG)
+ch = logging.StreamHandler()
+ch.setLevel(logging.DEBUG)
+ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+logger.addHandler(ch)
+fh = RotatingFileHandler("videogenericbot.log", maxBytes=5_000_000, backupCount=2, encoding="utf-8")
+fh.setLevel(logging.DEBUG)
+fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+logger.addHandler(fh)
+logging.getLogger("httpx").setLevel(logging.INFO)
+logging.getLogger("aiohttp").setLevel(logging.INFO)
 
 # ================== Configuration ==================
 # Load environment variables from .env file
@@ -19,11 +35,14 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 FAL_KEY = os.getenv("FAL_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable not set")
 if not FAL_KEY:
     raise ValueError("FAL_KEY environment variable not set")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY environment variable not set")
 
 # ================== FSM States ==================
 class BotStates(StatesGroup):
@@ -91,6 +110,72 @@ def create_confirmation_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📎 Upload corrected ZIP", callback_data="zip_upload")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+async def generate_unique_prompts(base_prompt: str, count: int) -> list[str]:
+    """Generate unique prompts using OpenAI API"""
+    logger.info("generate_unique_prompts START count=%s prompt=%s", count, base_prompt[:120])
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json"
+            }
+
+            instruction = f"""Generate exactly {count} short image prompts based on: "{base_prompt}"
+
+Rules:
+- Return ONLY a plain JSON array of strings: ["prompt 1", "prompt 2", ...]
+- NO nested JSON objects, NO markdown, NO triple backticks
+- Each prompt: maximum 200 characters, 1-2 short sentences
+- Vary ONLY: environment, scene, clothing style, small props, lighting, camera angle
+- DO NOT describe: body shape, anatomy, face details, pose, sexual/explicit content
+- Keep person's appearance implicit and unchanged
+- Example: "young woman in a cozy kitchen, soft morning light, holding a mug, candid social-media style"
+
+Output {count} prompts as a JSON array now:"""
+
+            payload = {
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": instruction
+                    }
+                ]
+            }
+
+            async with session.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload) as response:
+                logger.info("OpenAI status=%s", response.status)
+                result = await response.json()
+                content = result["choices"][0]["message"]["content"]
+                logger.debug("OpenAI raw: %s", content[:4000])
+
+                # Remove markdown code blocks if present
+                content = content.strip()
+                if content.startswith("```json"):
+                    content = content[7:]
+                elif content.startswith("```"):
+                    content = content[3:]
+                if content.endswith("```"):
+                    content = content[:-3]
+                content = content.strip()
+
+                # Parse JSON array from response
+                prompts = json.loads(content)
+
+                # Validate: must be a list of strings
+                if not isinstance(prompts, list):
+                    logger.error("OpenAI returned non-list: %s", type(prompts))
+                    return [base_prompt] * count
+                if not all(isinstance(p, str) for p in prompts):
+                    logger.error("OpenAI returned non-string items in list")
+                    return [base_prompt] * count
+
+                return prompts
+    except Exception as e:
+        logger.exception("OpenAI error")
+        # Fallback: return list repeating the base prompt
+        return [base_prompt] * count
 
 # ================== Command Handlers ==================
 @dp.message(Command("start"))
@@ -215,10 +300,24 @@ async def choose_num_images(callback: CallbackQuery, state: FSMContext):
     num_images = int(callback.data.split("_")[-1])
     await state.update_data(num_images_per_photo=num_images)
 
+    data = await state.get_data()
+    prompt_mode = data.get("prompt_mode")
+
     await callback.message.edit_text(
         f"✅ Got it! I'll generate <b>{num_images}</b> image(s) per source photo.",
         parse_mode="HTML"
     )
+
+    # Generate unique prompts if single mode
+    if prompt_mode == "single":
+        num_photos = len(data.get("source_photos", []))
+        total_images = num_photos * num_images
+        base_prompt = data.get("single_prompt")
+
+        await callback.message.answer("🤖 <b>Generating unique prompts...</b>\n\nPlease wait...", parse_mode="HTML")
+        unique_prompts = await generate_unique_prompts(base_prompt, total_images)
+        await state.update_data(unique_prompts=unique_prompts)
+
     await callback.message.answer("⏳ <b>Generating images...</b>\n\nThis may take a few moments. Please wait...", parse_mode="HTML")
     await callback.answer()
 
@@ -234,10 +333,13 @@ async def generate_images(message: Message, state: FSMContext):
     prompt_mode = data.get("prompt_mode")
     single_prompt = data.get("single_prompt")
     individual_prompts = data.get("individual_prompts", [])
+    unique_prompts = data.get("unique_prompts", [])
 
     all_generated_images = []
     temp_dir = Path("temp_photos")
     temp_dir.mkdir(exist_ok=True)
+
+    global_index = 0
 
     try:
         for idx, photo_file_id in enumerate(source_photos):
@@ -249,36 +351,78 @@ async def generate_images(message: Message, state: FSMContext):
             # Upload to FAL
             image_url = fal_client.upload_file(str(photo_path))
 
-            # Get prompt for this photo
-            if prompt_mode == "single":
-                prompt = single_prompt
-            else:
-                prompt = individual_prompts[idx]
-
             # Generate images using nano-banana
             await message.answer(f"🎨 Generating images for photo {idx + 1}/{len(source_photos)}...")
 
-            result = await asyncio.to_thread(
-                fal_client.subscribe,
-                "fal-ai/nano-banana/edit",
-                arguments={
-                    "prompt": prompt,
-                    "num_images": num_images,
-                    "image_urls": [image_url],
-                    "output_format": "png",
-                    "width": 1024,
-                    "height": 1024,
-                    "negative_prompt": "deformed face, distorted body, extra limbs, missing limbs, mismatched eyes, warped anatomy, AI artifacts, glitch, blur, low resolution, oversharpening, unnatural skin, plastic texture, flickering frames, jitter, unstable motion, unnatural hair movement, exaggerated expressions, incorrect lighting, watermark, text, logo, double face, duplicate features, asymmetrical eyes, bad proportions, cartoonish look, unrealistic body physics."
-                },
-                with_logs=False
-            )
+            # Use unique prompts for single mode, otherwise use existing logic
+            if prompt_mode == "single" and unique_prompts:
+                # Generate images one by one with unique prompts
+                total_images = len(source_photos) * num_images
+                for img_idx in range(num_images):
+                    prompt = unique_prompts[global_index]
 
-            # Download generated images
-            for img_idx, img in enumerate(result.get("images", [])):
-                img_url = img.get("url")
-                img_data = await download_file(img_url)
-                filename = f"generated_{idx}_{img_idx}.png"
-                all_generated_images.append((filename, img_data))
+                    # Show progress
+                    await message.answer(f"🔄 Generating image {global_index + 1}/{total_images}...")
+                    logger.info("Generating image %s/%s (global_index=%s)", global_index + 1, total_images, global_index)
+
+                    result = await asyncio.to_thread(
+                        fal_client.subscribe,
+                        "fal-ai/nano-banana/edit",
+                        arguments={
+                            "prompt": prompt,
+                            "num_images": 1,
+                            "image_urls": [image_url],
+                            "output_format": "png",
+                            "width": 1024,
+                            "height": 1024,
+                            "negative_prompt": "deformed face, distorted body, extra limbs, missing limbs, mismatched eyes, warped anatomy, AI artifacts, glitch, blur, low resolution, oversharpening, unnatural skin, plastic texture, flickering frames, jitter, unstable motion, unnatural hair movement, exaggerated expressions, incorrect lighting, watermark, text, logo, double face, duplicate features, asymmetrical eyes, bad proportions, cartoonish look, unrealistic body physics."
+                        },
+                        with_logs=False
+                    )
+
+                    # Download generated image with safety check
+                    images = result.get("images", [])
+                    if images and len(images) > 0:
+                        img = images[0]
+                        img_url = img.get("url")
+                        if img_url:
+                            img_data = await download_file(img_url)
+                            filename = f"generated_{idx}_{img_idx}.png"
+                            all_generated_images.append((filename, img_data))
+                            logger.info("Image generated global_index=%s filename=%s", global_index, filename)
+                    else:
+                        logger.error("Empty images array for prompt=%s global_index=%s", prompt[:120], global_index)
+
+                    global_index += 1
+            else:
+                # Original logic for individual mode
+                if prompt_mode == "single":
+                    prompt = single_prompt
+                else:
+                    prompt = individual_prompts[idx]
+
+                result = await asyncio.to_thread(
+                    fal_client.subscribe,
+                    "fal-ai/nano-banana/edit",
+                    arguments={
+                        "prompt": prompt,
+                        "num_images": num_images,
+                        "image_urls": [image_url],
+                        "output_format": "png",
+                        "width": 1024,
+                        "height": 1024,
+                        "negative_prompt": "deformed face, distorted body, extra limbs, missing limbs, mismatched eyes, warped anatomy, AI artifacts, glitch, blur, low resolution, oversharpening, unnatural skin, plastic texture, flickering frames, jitter, unstable motion, unnatural hair movement, exaggerated expressions, incorrect lighting, watermark, text, logo, double face, duplicate features, asymmetrical eyes, bad proportions, cartoonish look, unrealistic body physics."
+                    },
+                    with_logs=False
+                )
+
+                # Download generated images with safety check
+                for img_idx, img in enumerate(result.get("images", [])):
+                    img_url = img.get("url")
+                    if img_url:
+                        img_data = await download_file(img_url)
+                        filename = f"generated_{idx}_{img_idx}.png"
+                        all_generated_images.append((filename, img_data))
 
         # Create ZIP file
         zip_buffer = create_zip_from_images(all_generated_images)
