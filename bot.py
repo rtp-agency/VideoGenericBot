@@ -53,6 +53,7 @@ class BotStates(StatesGroup):
     choosing_num_images = State()
     generating_images = State()
     waiting_zip_confirmation = State()
+    waiting_video_zip = State()
     choosing_num_videos = State()
     entering_video_prompts = State()
     generating_videos = State()
@@ -94,6 +95,14 @@ def create_number_keyboard(max_num: int, callback_prefix: str) -> InlineKeyboard
         for i in range(1, max_num + 1)
     ]
     return InlineKeyboardMarkup(inline_keyboard=[buttons])
+
+def create_start_mode_keyboard() -> InlineKeyboardMarkup:
+    """Create keyboard for choosing start mode"""
+    buttons = [
+        [InlineKeyboardButton(text="📸 Generate images from photos", callback_data="start_mode_photos")],
+        [InlineKeyboardButton(text="🎬 Generate video from existing images", callback_data="start_mode_video")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def create_prompt_mode_keyboard() -> InlineKeyboardMarkup:
     """Create keyboard for choosing prompt mode"""
@@ -184,14 +193,39 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         "🎬 <b>Welcome to the Video Generation Bot!</b>\n\n"
-        "I'll help you transform your photos into stunning generated images and videos.\n\n"
-        "📸 <b>Step 1:</b> Please send me your source photos.\n"
-        "You can send multiple photos (up to 50-60 in production).\n\n"
+        "Please choose how you want to start:",
+        reply_markup=create_start_mode_keyboard(),
+        parse_mode="HTML"
+    )
+
+@dp.callback_query(F.data == "start_mode_photos")
+async def start_mode_photos(callback: CallbackQuery, state: FSMContext):
+    """Start with photo upload and image generation"""
+    await callback.message.edit_text(
+        "📸 <b>Generate images from photos</b>\n\n"
+        "Please send me your source photos.\n"
+        "You can send multiple photos.\n\n"
         "When you're done, type /done",
         parse_mode="HTML"
     )
     await state.set_state(BotStates.waiting_photos)
     await state.update_data(source_photos=[])
+    await callback.answer()
+
+@dp.callback_query(F.data == "start_mode_video")
+async def start_mode_video(callback: CallbackQuery, state: FSMContext):
+    """Start with existing images for video generation"""
+    await callback.message.edit_text(
+        "🎬 <b>Generate videos from existing images</b>\n\n"
+        "Please upload your images:\n"
+        "• Upload a ZIP file with images, OR\n"
+        "• Send individual photos (one or multiple)\n\n"
+        "When you're done, type /done",
+        parse_mode="HTML"
+    )
+    await state.set_state(BotStates.waiting_video_zip)
+    await state.update_data(video_images=[])
+    await callback.answer()
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
@@ -326,7 +360,7 @@ async def choose_num_images(callback: CallbackQuery, state: FSMContext):
 
 # ================== Image Generation ==================
 async def generate_images(message: Message, state: FSMContext):
-    """Generate images using fal-ai nano-banana"""
+    """Generate images using fal-ai Seedream V4"""
     data = await state.get_data()
     source_photos = data.get("source_photos", [])
     num_images = data.get("num_images_per_photo", 1)
@@ -351,7 +385,7 @@ async def generate_images(message: Message, state: FSMContext):
             # Upload to FAL
             image_url = fal_client.upload_file(str(photo_path))
 
-            # Generate images using nano-banana
+            # Generate images using Seedream V4
             await message.answer(f"🎨 Generating images for photo {idx + 1}/{len(source_photos)}...")
 
             # Use unique prompts for single mode, otherwise use existing logic
@@ -367,15 +401,15 @@ async def generate_images(message: Message, state: FSMContext):
 
                     result = await asyncio.to_thread(
                         fal_client.subscribe,
-                        "fal-ai/nano-banana/edit",
+                        "fal-ai/bytedance/seedream/v4/edit",
                         arguments={
                             "prompt": prompt,
                             "num_images": 1,
                             "image_urls": [image_url],
-                            "output_format": "png",
-                            "width": 1024,
-                            "height": 1024,
-                            "negative_prompt": "deformed face, distorted body, extra limbs, missing limbs, mismatched eyes, warped anatomy, AI artifacts, glitch, blur, low resolution, oversharpening, unnatural skin, plastic texture, flickering frames, jitter, unstable motion, unnatural hair movement, exaggerated expressions, incorrect lighting, watermark, text, logo, double face, duplicate features, asymmetrical eyes, bad proportions, cartoonish look, unrealistic body physics."
+                            "image_size": {
+                                "width": 1024,
+                                "height": 1024
+                            }
                         },
                         with_logs=False
                     )
@@ -403,15 +437,15 @@ async def generate_images(message: Message, state: FSMContext):
 
                 result = await asyncio.to_thread(
                     fal_client.subscribe,
-                    "fal-ai/nano-banana/edit",
+                    "fal-ai/bytedance/seedream/v4/edit",
                     arguments={
                         "prompt": prompt,
                         "num_images": num_images,
                         "image_urls": [image_url],
-                        "output_format": "png",
-                        "width": 1024,
-                        "height": 1024,
-                        "negative_prompt": "deformed face, distorted body, extra limbs, missing limbs, mismatched eyes, warped anatomy, AI artifacts, glitch, blur, low resolution, oversharpening, unnatural skin, plastic texture, flickering frames, jitter, unstable motion, unnatural hair movement, exaggerated expressions, incorrect lighting, watermark, text, logo, double face, duplicate features, asymmetrical eyes, bad proportions, cartoonish look, unrealistic body physics."
+                        "image_size": {
+                            "width": 1024,
+                            "height": 1024
+                        }
                     },
                     with_logs=False
                 )
@@ -500,6 +534,71 @@ async def receive_corrected_zip(message: Message, state: FSMContext):
     await state.update_data(generated_images=images)
     await message.answer(
         f"✅ Corrected ZIP received! Found <b>{len(images)}</b> images.\n\n"
+        "🎬 Now, <b>how many videos should I generate for each image?</b>",
+        reply_markup=create_number_keyboard(5, "num_videos"),
+        parse_mode="HTML"
+    )
+    await state.set_state(BotStates.choosing_num_videos)
+
+@dp.message(BotStates.waiting_video_zip, F.photo)
+async def receive_video_photo(message: Message, state: FSMContext):
+    """Receive individual photos for video generation"""
+    data = await state.get_data()
+    video_images = data.get("video_images", [])
+
+    # Download photo
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    photo_data = BytesIO()
+    await bot.download_file(file.file_path, photo_data)
+
+    # Add to collection
+    filename = f"image_{len(video_images)}.jpg"
+    video_images.append((filename, photo_data.getvalue()))
+
+    await state.update_data(video_images=video_images)
+    await message.answer(f"✅ Photo {len(video_images)} received. Send more or type /done to continue.")
+
+@dp.message(BotStates.waiting_video_zip, F.document)
+async def receive_video_zip(message: Message, state: FSMContext):
+    """Receive ZIP with images for video generation"""
+    if not message.document.file_name.endswith('.zip'):
+        await message.answer("❌ Please upload a ZIP file or send photos directly.")
+        return
+
+    data = await state.get_data()
+    video_images = data.get("video_images", [])
+
+    # Download ZIP
+    file = await bot.get_file(message.document.file_id)
+    zip_data = BytesIO()
+    await bot.download_file(file.file_path, zip_data)
+
+    # Extract images
+    images_from_zip = await extract_images_from_zip(zip_data.getvalue())
+
+    if not images_from_zip:
+        await message.answer("❌ No images found in ZIP. Please upload a valid ZIP with images.")
+        return
+
+    # Merge with existing images
+    video_images.extend(images_from_zip)
+    await state.update_data(video_images=video_images)
+    await message.answer(f"✅ ZIP received! Added {len(images_from_zip)} images. Total: {len(video_images)} images.\n\nSend more or type /done to continue.")
+
+@dp.message(BotStates.waiting_video_zip, Command("done"))
+async def video_images_done(message: Message, state: FSMContext):
+    """User finished uploading images for video generation"""
+    data = await state.get_data()
+    video_images = data.get("video_images", [])
+
+    if not video_images:
+        await message.answer("❌ Please upload at least one image or ZIP file first!")
+        return
+
+    await state.update_data(generated_images=video_images)
+    await message.answer(
+        f"✅ Great! I have <b>{len(video_images)}</b> images.\n\n"
         "🎬 Now, <b>how many videos should I generate for each image?</b>",
         reply_markup=create_number_keyboard(5, "num_videos"),
         parse_mode="HTML"
