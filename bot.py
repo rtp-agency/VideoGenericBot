@@ -6,6 +6,7 @@ from io import BytesIO
 from pathlib import Path
 import aiohttp
 import fal_client
+from PIL import Image
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -70,12 +71,26 @@ async def download_file(url: str) -> bytes:
         async with session.get(url) as response:
             return await response.read()
 
+def log_image_details(img_bytes: bytes, filename: str):
+    """Log image format, resolution, color mode, and size without modifying the image"""
+    try:
+        img = Image.open(BytesIO(img_bytes))
+        logger.info(
+            "Image details: filename=%s, format=%s, size=%dx%d, mode=%s, bytes=%d",
+            filename, img.format, img.width, img.height, img.mode, len(img_bytes)
+        )
+    except Exception as e:
+        logger.error("Failed to read image details for %s: %s", filename, str(e))
+
 def create_zip_from_images(image_data_list: list) -> BytesIO:
-    """Create ZIP file from list of (filename, bytes) tuples"""
+    """Create ZIP file from list of (filename, bytes) tuples
+
+    Uses writestr to store raw image bytes without re-encoding or modification.
+    """
     zip_buffer = BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
         for filename, data in image_data_list:
-            zip_file.writestr(filename, data)
+            zip_file.writestr(filename, data)  # Raw bytes, no re-encoding
     zip_buffer.seek(0)
     return zip_buffer
 
@@ -342,15 +357,15 @@ async def choose_num_images(callback: CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
 
-    # Generate unique prompts if single mode
-    if prompt_mode == "single":
-        num_photos = len(data.get("source_photos", []))
-        total_images = num_photos * num_images
-        base_prompt = data.get("single_prompt")
-
-        await callback.message.answer("🤖 <b>Generating unique prompts...</b>\n\nPlease wait...", parse_mode="HTML")
-        unique_prompts = await generate_unique_prompts(base_prompt, total_images)
-        await state.update_data(unique_prompts=unique_prompts)
+    # OpenAI unique prompt generation DISABLED - use user's exact prompt
+    # if prompt_mode == "single":
+    #     num_photos = len(data.get("source_photos", []))
+    #     total_images = num_photos * num_images
+    #     base_prompt = data.get("single_prompt")
+    #
+    #     await callback.message.answer("🤖 <b>Generating unique prompts...</b>\n\nPlease wait...", parse_mode="HTML")
+    #     unique_prompts = await generate_unique_prompts(base_prompt, total_images)
+    #     await state.update_data(unique_prompts=unique_prompts)
 
     await callback.message.answer("⏳ <b>Generating images...</b>\n\nThis may take a few moments. Please wait...", parse_mode="HTML")
     await callback.answer()
@@ -360,7 +375,7 @@ async def choose_num_images(callback: CallbackQuery, state: FSMContext):
 
 # ================== Image Generation ==================
 async def generate_images(message: Message, state: FSMContext):
-    """Generate images using fal-ai Seedream V4"""
+    """Generate images using fal-ai nano-banana-pro"""
     data = await state.get_data()
     source_photos = data.get("source_photos", [])
     num_images = data.get("num_images_per_photo", 1)
@@ -385,12 +400,12 @@ async def generate_images(message: Message, state: FSMContext):
             # Upload to FAL
             image_url = fal_client.upload_file(str(photo_path))
 
-            # Generate images using Seedream V4
+            # Generate images using nano-banana-pro
             await message.answer(f"🎨 Generating images for photo {idx + 1}/{len(source_photos)}...")
 
-            # Use unique prompts for single mode, otherwise use existing logic
-            if prompt_mode == "single" and unique_prompts:
-                # Generate images one by one with unique prompts
+            # Use user's exact prompt - unique prompt generation DISABLED
+            if False:  # prompt_mode == "single" and unique_prompts:
+                # Generate images one by one with unique prompts (DISABLED)
                 total_images = len(source_photos) * num_images
                 for img_idx in range(num_images):
                     prompt = unique_prompts[global_index]
@@ -399,20 +414,26 @@ async def generate_images(message: Message, state: FSMContext):
                     await message.answer(f"🔄 Generating image {global_index + 1}/{total_images}...")
                     logger.info("Generating image %s/%s (global_index=%s)", global_index + 1, total_images, global_index)
 
+                    # Log nano-banana-pro request (truncated)
+                    request_args = {
+                        "prompt": prompt,
+                        "num_images": 1,
+                        "image_urls": [image_url],
+                        "output_format": "png",
+                        "resolution": "1K",
+                        "aspect_ratio": "1:1"
+                    }
+                    logger.debug("nano-banana-pro request: %s", str(request_args)[:1500])
+
                     result = await asyncio.to_thread(
                         fal_client.subscribe,
-                        "fal-ai/bytedance/seedream/v4/edit",
-                        arguments={
-                            "prompt": prompt,
-                            "num_images": 1,
-                            "image_urls": [image_url],
-                            "image_size": {
-                                "width": 1024,
-                                "height": 1024
-                            }
-                        },
+                        "fal-ai/nano-banana-pro/edit",
+                        arguments=request_args,
                         with_logs=False
                     )
+
+                    # Log nano-banana-pro response info
+                    logger.debug("nano-banana-pro response: images_count=%d", len(result.get("images", [])))
 
                     # Download generated image with safety check
                     images = result.get("images", [])
@@ -422,6 +443,7 @@ async def generate_images(message: Message, state: FSMContext):
                         if img_url:
                             img_data = await download_file(img_url)
                             filename = f"generated_{idx}_{img_idx}.png"
+                            log_image_details(img_data, filename)
                             all_generated_images.append((filename, img_data))
                             logger.info("Image generated global_index=%s filename=%s", global_index, filename)
                     else:
@@ -435,20 +457,26 @@ async def generate_images(message: Message, state: FSMContext):
                 else:
                     prompt = individual_prompts[idx]
 
+                # Log nano-banana-pro request (truncated)
+                request_args = {
+                    "prompt": prompt,
+                    "num_images": num_images,
+                    "image_urls": [image_url],
+                    "output_format": "png",
+                    "resolution": "1K",
+                    "aspect_ratio": "1:1"
+                }
+                logger.debug("nano-banana-pro request: %s", str(request_args)[:1500])
+
                 result = await asyncio.to_thread(
                     fal_client.subscribe,
-                    "fal-ai/bytedance/seedream/v4/edit",
-                    arguments={
-                        "prompt": prompt,
-                        "num_images": num_images,
-                        "image_urls": [image_url],
-                        "image_size": {
-                            "width": 1024,
-                            "height": 1024
-                        }
-                    },
+                    "fal-ai/nano-banana-pro/edit",
+                    arguments=request_args,
                     with_logs=False
                 )
+
+                # Log nano-banana-pro response info
+                logger.debug("nano-banana-pro response: images_count=%d", len(result.get("images", [])))
 
                 # Download generated images with safety check
                 for img_idx, img in enumerate(result.get("images", [])):
@@ -456,6 +484,7 @@ async def generate_images(message: Message, state: FSMContext):
                     if img_url:
                         img_data = await download_file(img_url)
                         filename = f"generated_{idx}_{img_idx}.png"
+                        log_image_details(img_data, filename)
                         all_generated_images.append((filename, img_data))
 
         # Create ZIP file
@@ -700,7 +729,10 @@ async def generate_videos(message: Message, state: FSMContext):
                         "prompt": prompt,
                         "image_url": image_url,
                         "resolution": "720p",
-                        "duration": "5"
+                        "duration": "5",
+                        "negative_prompt": "deformed face, distorted body, extra limbs, missing limbs, mismatched eyes, warped anatomy, AI artifacts, glitch, blur, low resolution, oversharpening, unnatural skin, plastic texture, flickering frames, jitter, unstable motion, unnatural hair movement, exaggerated expressions, incorrect lighting, watermark, text, logo, double face, duplicate features, asymmetrical eyes, bad proportions, cartoonish look, unrealistic body physics.",
+                        "enable_prompt_expansion": True,
+                        "enable_safety_checker": False
                     },
                     with_logs=False
                 )
