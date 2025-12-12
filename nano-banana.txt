@@ -1,5 +1,5 @@
 About
-Gemini 3 Pro Image is a text-to-image model that generates images from text descriptions.
+Gemini 2.5 Flash Image is a text-to-image model that generates images from text descriptions.
 
 1. Calling the API
 #
@@ -29,7 +29,7 @@ def on_queue_update(update):
            print(log["message"])
 
 result = fal_client.subscribe(
-    "fal-ai/nano-banana-pro/edit",
+    "fal-ai/nano-banana/edit",
     arguments={
         "prompt": "make a photo of the man driving the car down the california coastline",
         "image_urls": ["https://storage.googleapis.com/falserverless/example_inputs/nano-banana-edit-input.png", "https://storage.googleapis.com/falserverless/example_inputs/nano-banana-edit-input-2.png"]
@@ -61,7 +61,7 @@ PythonPython (async)
 import fal_client
 
 handler = fal_client.submit(
-    "fal-ai/nano-banana-pro/edit",
+    "fal-ai/nano-banana/edit",
     arguments={
         "prompt": "make a photo of the man driving the car down the california coastline",
         "image_urls": ["https://storage.googleapis.com/falserverless/example_inputs/nano-banana-edit-input.png", "https://storage.googleapis.com/falserverless/example_inputs/nano-banana-edit-input-2.png"]
@@ -76,14 +76,14 @@ You can fetch the status of a request to check if it is completed or still in pr
 
 PythonPython (async)
 
-status = fal_client.status("fal-ai/nano-banana-pro/edit", request_id, with_logs=True)
+status = fal_client.status("fal-ai/nano-banana/edit", request_id, with_logs=True)
 Get the result
 #
 Once the request is completed, you can fetch the result. See the Output Schema for the expected result format.
 
 PythonPython (async)
 
-result = fal_client.result("fal-ai/nano-banana-pro/edit", request_id)
+result = fal_client.result("fal-ai/nano-banana/edit", request_id)
 4. Files
 #
 Some attributes in the API accept file URLs as input. Whenever that's the case you can pass your own URL or a Base64 data URI.
@@ -115,8 +115,8 @@ The prompt for image editing.
 num_images integer
 The number of images to generate. Default value: 1
 
-aspect_ratio AspectRatioEnum
-The aspect ratio of the generated image. Default value: "auto"
+aspect_ratio Enum
+The aspect ratio of the generated image. Default value: auto
 
 Possible enum values: auto, 21:9, 16:9, 3:2, 4:3, 5:4, 1:1, 4:5, 3:4, 2:3, 9:16
 
@@ -131,16 +131,8 @@ If True, the media will be returned as a data URI and the output data won't be a
 image_urls list<string>
 The URLs of the images to use for image-to-image generation or image editing.
 
-resolution ResolutionEnum
-The resolution of the image to generate. Default value: "1K"
-
-Possible enum values: 1K, 2K, 4K
-
 limit_generations boolean
 Experimental parameter to limit the number of generations from each round of prompting to 1. Set to True to to disregard any instructions in the prompt regarding the number of images to generate.
-
-enable_web_search boolean
-Enable web search for the image generation task. This will allow the model to use the latest information from the web to generate the image.
 
 
 {
@@ -151,8 +143,7 @@ Enable web search for the image generation task. This will allow the model to us
   "image_urls": [
     "https://storage.googleapis.com/falserverless/example_inputs/nano-banana-edit-input.png",
     "https://storage.googleapis.com/falserverless/example_inputs/nano-banana-edit-input-2.png"
-  ],
-  "resolution": "1K"
+  ]
 }
 Output
 #
@@ -188,9 +179,6 @@ The name of the file. It will be auto-generated if not provided.
 
 file_size integer
 The size of the file in bytes.
-
-file_data string
-File data
 
 width integer
 The width of the image
