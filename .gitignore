@@ -25,6 +25,7 @@ generated_videos/
 
 # logs
 *.log
+*.json
+.claude/
 
-.claude/*
-
+Google_Drive_ID.txt
