@@ -571,7 +571,7 @@ async def choose_num_images(callback: CallbackQuery, state: FSMContext):
 
 # ================== Image Generation ==================
 async def generate_images(message: Message, state: FSMContext):
-    """Generate images using fal-ai nano-banana-pro with parallel processing"""
+    """Generate images using fal-ai nano-banana-pro"""
     data = await state.get_data()
     source_photos = data.get("source_photos", [])
     num_images = data.get("num_images_per_photo", 1)
@@ -584,8 +584,7 @@ async def generate_images(message: Message, state: FSMContext):
     temp_dir.mkdir(exist_ok=True)
 
     try:
-        # Функция для генерации изображений из одного фото
-        async def process_single_photo(idx: int, photo_file_id: str):
+        for idx, photo_file_id in enumerate(source_photos):
             # Download photo from Telegram
             file = await bot.get_file(photo_file_id)
             photo_path = temp_dir / f"source_{idx}.jpg"
@@ -593,6 +592,9 @@ async def generate_images(message: Message, state: FSMContext):
 
             # Upload to FAL
             image_url = fal_client.upload_file(str(photo_path))
+
+            # Generate images using nano-banana-pro
+            await message.answer(f"🎨 Generating images for photo {idx + 1}/{len(source_photos)}...")
 
             # Determine which prompt to use
             if prompt_mode == "single":
@@ -621,36 +623,13 @@ async def generate_images(message: Message, state: FSMContext):
             logger.debug("nano-banana response: images_count=%d", len(result.get("images", [])))
 
             # Download generated images with safety check
-            photo_images = []
             for img_idx, img in enumerate(result.get("images", [])):
                 img_url = img.get("url")
                 if img_url:
                     img_data = await download_file(img_url)
                     filename = f"generated_{idx}_{img_idx}.png"
                     log_image_details(img_data, filename)
-                    photo_images.append((filename, img_data))
-            
-            return photo_images
-
-        # Параллельная обработка всех фотографий
-        await message.answer(f"🎨 Generating images for {len(source_photos)} photos in parallel...")
-        
-        tasks = [process_single_photo(idx, photo_id) for idx, photo_id in enumerate(source_photos)]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Собираем результаты
-        for idx, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(f"Error processing photo {idx}: {str(result)}")
-                await message.answer(f"⚠️ Error processing photo {idx + 1}: {str(result)}")
-            else:
-                all_generated_images.extend(result)
-                await message.answer(f"✅ Photo {idx + 1}/{len(source_photos)} completed ({len(result)} images)")
-
-        if not all_generated_images:
-            await message.answer("❌ No images were generated successfully. Please try again.")
-            await state.clear()
-            return
+                    all_generated_images.append((filename, img_data))
 
         # Create ZIP file
         zip_buffer = create_zip_from_images(all_generated_images)
@@ -855,7 +834,7 @@ async def receive_video_prompt(message: Message, state: FSMContext):
 
 # ================== Video Generation ==================
 async def generate_videos(message: Message, state: FSMContext):
-    """Generate videos using FAL AI WAN 2.5 with parallel processing"""
+    """Generate videos using FAL AI WAN 2.5"""
     data = await state.get_data()
     generated_images = data.get("generated_images", [])
     num_videos_per_image = data.get("num_videos_per_image", 1)
@@ -868,85 +847,66 @@ async def generate_videos(message: Message, state: FSMContext):
     temp_videos_dir.mkdir(exist_ok=True)
 
     try:
-        # Функция для генерации одного видео
-        async def generate_single_video(img_idx: int, filename: str, img_data: bytes, vid_idx: int, prompt: str, prompt_idx: int):
+        prompt_idx = 0
+
+        for img_idx, (filename, img_data) in enumerate(generated_images):
             # Save image temporarily
-            img_path = temp_dir / f"{filename}_{vid_idx}"
+            img_path = temp_dir / filename
             with open(img_path, 'wb') as f:
                 f.write(img_data)
 
             # Upload to FAL to get URL
             image_url = fal_client.upload_file(str(img_path))
 
-            # Generate random seed for this video
-            video_seed = random.randint(0, 2**31 - 1)
-
-            # Generate video using FAL AI WAN 2.5
-            result = await asyncio.to_thread(
-                fal_client.subscribe,
-                "fal-ai/wan-25-preview/image-to-video",
-                arguments={
-                    "prompt": prompt,
-                    "image_url": image_url,
-                    "resolution": "720p",
-                    "duration": "5",
-                    "negative_prompt": "deformed face, distorted body, extra limbs, missing limbs, mismatched eyes, warped anatomy, AI artifacts, glitch, blur, low resolution, oversharpening, unnatural skin, plastic texture, flickering frames, jitter, unstable motion, unnatural hair movement, exaggerated expressions, incorrect lighting, watermark, text, logo, double face, duplicate features, asymmetrical eyes, bad proportions, cartoonish look, unrealistic body physics, temporal inconsistency, morphing objects, appearing objects, disappearing objects, duplicating limbs, multiplying objects, teleportation, physics violations, impossible movements, shape-shifting, object fusion, floating objects, gravity defects.",
-                    "enable_prompt_expansion": False,
-                    "enable_safety_checker": False,
-                    "seed": video_seed
-                },
-                with_logs=False
-            )
-
-            # Get video URL from result
-            video_url = result.get("video", {}).get("url")
-
-            if video_url:
-                video_data = await download_file(video_url)
-
-                # Save video to temp file
-                video_filename = f"video_{img_idx}_{vid_idx}.mp4"
-                video_path = temp_videos_dir / video_filename
-                with open(video_path, 'wb') as f:
-                    f.write(video_data)
-
-                return (prompt_idx, video_filename, video_data, video_path, prompt, filename)
-            
-            return None
-
-        # Подготовка всех задач
-        tasks = []
-        prompt_idx = 0
-        
-        for img_idx, (filename, img_data) in enumerate(generated_images):
             for vid_idx in range(num_videos_per_image):
                 prompt = video_prompts[prompt_idx]
-                tasks.append(generate_single_video(img_idx, filename, img_data, vid_idx, prompt, prompt_idx))
                 prompt_idx += 1
 
-        # Параллельная генерация видео (батчами по 5 для контроля нагрузки)
-        batch_size = 5
-        all_results = []
-        
-        for i in range(0, len(tasks), batch_size):
-            batch = tasks[i:i + batch_size]
-            await message.answer(f"🎬 Generating videos batch {i//batch_size + 1}/{(len(tasks) + batch_size - 1)//batch_size}...")
-            
-            batch_results = await asyncio.gather(*batch, return_exceptions=True)
-            
-            for result in batch_results:
-                if isinstance(result, Exception):
-                    logger.error(f"Error generating video: {str(result)}")
-                elif result:
-                    all_results.append(result)
+                await message.answer(
+                    f"🎬 Generating video {prompt_idx}/{len(video_prompts)}...\n"
+                    f"Image: {filename}\n"
+                    f"Prompt: {prompt[:50]}..."
+                )
 
-        # Отправка результатов
-        for prompt_idx, video_filename, video_data, video_path, prompt, source_img in sorted(all_results, key=lambda x: x[0]):
-            await message.answer_video(
-                video=BufferedInputFile(video_data, filename=video_filename),
-                caption=f"✨ Video {prompt_idx + 1}/{len(video_prompts)}\n\n📝 Prompt: {prompt}",
-                reply_markup=create_drive_upload_keyboard(str(video_path))
-            )
+                # Generate random seed for this video
+                video_seed = random.randint(0, 2**31 - 1)
+
+                # Generate video using FAL AI WAN 2.5
+                result = await asyncio.to_thread(
+                    fal_client.subscribe,
+                    "fal-ai/wan-25-preview/image-to-video",
+                    arguments={
+                        "prompt": prompt,
+                        "image_url": image_url,
+                        "resolution": "720p",
+                        "duration": "5",
+                        "negative_prompt": "deformed face, distorted body, extra limbs, missing limbs, mismatched eyes, warped anatomy, AI artifacts, glitch, blur, low resolution, oversharpening, unnatural skin, plastic texture, flickering frames, jitter, unstable motion, unnatural hair movement, exaggerated expressions, incorrect lighting, watermark, text, logo, double face, duplicate features, asymmetrical eyes, bad proportions, cartoonish look, unrealistic body physics, temporal inconsistency, morphing objects, appearing objects, disappearing objects, duplicating limbs, multiplying objects, teleportation, physics violations, impossible movements, shape-shifting, object fusion, floating objects, gravity defects.",
+                        "enable_prompt_expansion": False,
+                        "enable_safety_checker": False,
+                        "seed": video_seed
+                    },
+                    with_logs=False
+                )
+
+                # Get video URL from result
+                video_url = result.get("video", {}).get("url")
+
+                # Download and send video
+                if video_url:
+                    video_data = await download_file(video_url)
+
+                    # Save video to temp file
+                    video_filename = f"video_{img_idx}_{vid_idx}.mp4"
+                    video_path = temp_videos_dir / video_filename
+                    with open(video_path, 'wb') as f:
+                        f.write(video_data)
+
+                    # Send video with upload button
+                    await message.answer_video(
+                        video=BufferedInputFile(video_data, filename=video_filename),
+                        caption=f"✨ Video {prompt_idx}/{len(video_prompts)}\n\n📝 Prompt: {prompt}",
+                        reply_markup=create_drive_upload_keyboard(str(video_path))
+                    )
 
         await message.answer(
             "🎉 <b>All videos generated successfully!</b>\n\n"
@@ -1041,7 +1001,7 @@ async def select_voice_for_lipsync(callback: CallbackQuery, state: FSMContext):
     await process_lipsync_videos(callback.message, state)
 
 async def process_lipsync_videos(message: Message, state: FSMContext):
-    """Process videos with voice change using parallel processing"""
+    """Process videos with voice change"""
     data = await state.get_data()
     video_ids = data.get("lipsync_videos", [])
     voice_id = data.get("selected_voice_id")
@@ -1052,8 +1012,9 @@ async def process_lipsync_videos(message: Message, state: FSMContext):
     processed_videos = []
     
     try:
-        # Функция для обработки одного видео
-        async def process_single_video(idx: int, video_id: str):
+        for idx, video_id in enumerate(video_ids):
+            await message.answer(f"🎬 Processing video {idx + 1}/{len(video_ids)}...")
+            
             # Download video
             file = await bot.get_file(video_id)
             video_path = temp_dir / f"input_{idx}.mp4"
@@ -1062,14 +1023,14 @@ async def process_lipsync_videos(message: Message, state: FSMContext):
             # Extract audio
             audio_path = temp_dir / f"audio_{idx}.mp3"
             if not extract_audio_from_video(str(video_path), str(audio_path)):
-                return (idx, None, "Failed to extract audio")
+                await message.answer(f"⚠️ Failed to extract audio from video {idx + 1}, skipping...")
+                continue
             
             # Change voice using ElevenLabs
             changed_audio_path = temp_dir / f"changed_audio_{idx}.mp3"
             
             try:
                 with open(audio_path, 'rb') as audio_file:
-                    # Using ElevenLabs speech-to-speech
                     result = await asyncio.to_thread(
                         elevenlabs_client.speech_to_speech.convert,
                         audio=audio_file.read(),
@@ -1077,7 +1038,6 @@ async def process_lipsync_videos(message: Message, state: FSMContext):
                         model_id="eleven_multilingual_sts_v2"
                     )
                     
-                    # Save the result
                     with open(changed_audio_path, 'wb') as f:
                         for chunk in result:
                             f.write(chunk)
@@ -1085,51 +1045,26 @@ async def process_lipsync_videos(message: Message, state: FSMContext):
                     logger.info(f"Voice changed successfully for video {idx}")
             except Exception as e:
                 logger.error(f"Failed to change voice: {str(e)}")
-                return (idx, None, f"Failed to change voice: {str(e)}")
+                await message.answer(f"⚠️ Failed to change voice for video {idx + 1}, skipping...")
+                continue
             
             # Merge audio back with video
             output_path = temp_dir / f"output_{idx}.mp4"
             if not merge_audio_with_video(str(video_path), str(changed_audio_path), str(output_path)):
-                return (idx, None, "Failed to merge audio")
+                await message.answer(f"⚠️ Failed to merge audio for video {idx + 1}, skipping...")
+                continue
             
             # Read the processed video
             with open(output_path, 'rb') as f:
                 video_data = f.read()
             
-            return (idx, (f"lipsync_video_{idx}.mp4", video_data, str(output_path)), None)
-
-        # Параллельная обработка видео (батчами по 3 для контроля нагрузки)
-        batch_size = 3
-        all_results = []
-        
-        for i in range(0, len(video_ids), batch_size):
-            batch_ids = video_ids[i:i + batch_size]
-            batch_indices = range(i, min(i + batch_size, len(video_ids)))
+            processed_videos.append((f"lipsync_video_{idx}.mp4", video_data))
             
-            await message.answer(f"🎬 Processing videos batch {i//batch_size + 1}/{(len(video_ids) + batch_size - 1)//batch_size}...")
-            
-            tasks = [process_single_video(idx, video_id) for idx, video_id in zip(batch_indices, batch_ids)]
-            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            for result in batch_results:
-                if isinstance(result, Exception):
-                    logger.error(f"Error processing video: {str(result)}")
-                    await message.answer(f"⚠️ Error: {str(result)}")
-                else:
-                    idx, data, error = result
-                    if error:
-                        await message.answer(f"⚠️ Video {idx + 1}: {error}")
-                    else:
-                        all_results.append(data)
-
-        # Отправка результатов
-        for filename, video_data, output_path in all_results:
-            processed_videos.append((filename, video_data))
-            
+            # Send processed video
             await message.answer_video(
-                video=BufferedInputFile(video_data, filename=filename),
-                caption=f"✨ Processed video",
-                reply_markup=create_drive_upload_keyboard(output_path)
+                video=BufferedInputFile(video_data, filename=f"lipsync_video_{idx}.mp4"),
+                caption=f"✨ Processed video {idx + 1}/{len(video_ids)}",
+                reply_markup=create_drive_upload_keyboard(str(output_path))
             )
         
         # Create ZIP with all videos
@@ -1259,7 +1194,7 @@ async def select_voice_for_image_lipsync(callback: CallbackQuery, state: FSMCont
     await generate_lipsync_from_images(callback.message, state)
 
 async def generate_lipsync_from_images(message: Message, state: FSMContext):
-    """Generate videos from images with voice change using parallel processing"""
+    """Generate videos from images with voice change"""
     data = await state.get_data()
     images = data.get("lipsync_images", [])
     prompt = data.get("lipsync_video_prompt")
@@ -1271,10 +1206,11 @@ async def generate_lipsync_from_images(message: Message, state: FSMContext):
     processed_videos = []
     
     try:
-        # Функция для обработки одного изображения
-        async def process_single_image(idx: int, filename: str, img_data: bytes):
+        for idx, (filename, img_data) in enumerate(images):
+            await message.answer(f"🎬 Generating video {idx + 1}/{len(images)}...")
+            
             # Save image
-            img_path = temp_dir / f"{idx}_{filename}"
+            img_path = temp_dir / filename
             with open(img_path, 'wb') as f:
                 f.write(img_data)
             
@@ -1301,7 +1237,8 @@ async def generate_lipsync_from_images(message: Message, state: FSMContext):
             
             video_url = result.get("video", {}).get("url")
             if not video_url:
-                return (idx, None, "Failed to generate video")
+                await message.answer(f"⚠️ Failed to generate video from image {idx + 1}, skipping...")
+                continue
             
             # Download video
             video_data = await download_file(video_url)
@@ -1309,10 +1246,13 @@ async def generate_lipsync_from_images(message: Message, state: FSMContext):
             with open(video_path, 'wb') as f:
                 f.write(video_data)
             
+            await message.answer(f"🎤 Processing voice for video {idx + 1}/{len(images)}...")
+            
             # Extract audio from generated video
             audio_path = temp_dir / f"audio_{idx}.mp3"
             if not extract_audio_from_video(str(video_path), str(audio_path)):
-                return (idx, None, "Failed to extract audio")
+                await message.answer(f"⚠️ Failed to extract audio from video {idx + 1}, skipping...")
+                continue
             
             # Change voice using ElevenLabs speech-to-speech
             changed_audio_path = temp_dir / f"changed_audio_{idx}.mp3"
@@ -1332,51 +1272,26 @@ async def generate_lipsync_from_images(message: Message, state: FSMContext):
                     logger.info(f"Voice changed successfully for video {idx}")
             except Exception as e:
                 logger.error(f"Failed to change voice: {str(e)}")
-                return (idx, None, f"Failed to change voice: {str(e)}")
+                await message.answer(f"⚠️ Failed to change voice for video {idx + 1}, skipping...")
+                continue
             
             # Merge changed audio with video
             output_path = temp_dir / f"output_{idx}.mp4"
             if not merge_audio_with_video(str(video_path), str(changed_audio_path), str(output_path)):
-                return (idx, None, "Failed to merge audio")
+                await message.answer(f"⚠️ Failed to merge audio for video {idx + 1}, skipping...")
+                continue
             
             # Read processed video
             with open(output_path, 'rb') as f:
                 final_video_data = f.read()
             
-            return (idx, (f"lipsync_generated_{idx}.mp4", final_video_data, str(output_path)), None)
-
-        # Параллельная обработка изображений (батчами по 3)
-        batch_size = 3
-        all_results = []
-        
-        for i in range(0, len(images), batch_size):
-            batch_images = images[i:i + batch_size]
-            batch_indices = range(i, min(i + batch_size, len(images)))
+            processed_videos.append((f"lipsync_generated_{idx}.mp4", final_video_data))
             
-            await message.answer(f"🎬 Processing images batch {i//batch_size + 1}/{(len(images) + batch_size - 1)//batch_size}...")
-            
-            tasks = [process_single_image(idx, filename, img_data) for idx, (filename, img_data) in zip(batch_indices, batch_images)]
-            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            for result in batch_results:
-                if isinstance(result, Exception):
-                    logger.error(f"Error processing image: {str(result)}")
-                    await message.answer(f"⚠️ Error: {str(result)}")
-                else:
-                    idx, data, error = result
-                    if error:
-                        await message.answer(f"⚠️ Image {idx + 1}: {error}")
-                    else:
-                        all_results.append(data)
-
-        # Отправка результатов
-        for filename, video_data, output_path in all_results:
-            processed_videos.append((filename, video_data))
-            
+            # Send video
             await message.answer_video(
-                video=BufferedInputFile(video_data, filename=filename),
-                caption=f"✨ Video with voice change",
-                reply_markup=create_drive_upload_keyboard(output_path)
+                video=BufferedInputFile(final_video_data, filename=f"lipsync_generated_{idx}.mp4"),
+                caption=f"✨ Video {idx + 1}/{len(images)} with voice change",
+                reply_markup=create_drive_upload_keyboard(str(output_path))
             )
         
         # Create ZIP
