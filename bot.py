@@ -3,7 +3,28 @@ import json
 import os
 import random
 import zipfile
+import rarfile
 from io import BytesIO
+import platform
+
+# Настройка rarfile для Windows
+if platform.system() == 'Windows':
+    # Пробуем найти UnRAR.exe в стандартных местах
+    import os
+    possible_paths = [
+        r"C:\Program Files\WinRAR\UnRAR.exe",
+        r"C:\Program Files (x86)\WinRAR\UnRAR.exe",
+        r"C:\unrar\UnRAR.exe",
+    ]
+    
+    for path in possible_paths:
+        if os.path.exists(path):
+            rarfile.UNRAR_TOOL = path
+            print(f"✅ Found UnRAR.exe at: {path}")
+            break
+    else:
+        print("⚠️  UnRAR.exe not found in standard locations!")
+        print("Please install WinRAR or set rarfile.UNRAR_TOOL manually")
 from pathlib import Path
 import aiohttp
 import fal_client
@@ -140,13 +161,80 @@ def create_zip_from_videos(video_data_list: list) -> BytesIO:
     zip_buffer.seek(0)
     return zip_buffer
 
-async def extract_images_from_zip(zip_data: bytes) -> list:
+async def extract_images_from_archive(zip_data: bytes) -> list:
     """Extract images from ZIP file, returns list of (filename, bytes)"""
     images = []
     with zipfile.ZipFile(BytesIO(zip_data), 'r') as zip_file:
-        for filename in zip_file.namelist():
-            if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                images.append((filename, zip_file.read(filename)))
+        all_files = zip_file.namelist()
+        logger.info(f"ZIP contains {len(all_files)} files: {all_files[:10]}...")  # Log first 10 files
+        
+        for filename in all_files:
+            # Игнорируем служебные папки Mac и скрытые файлы
+            if '__MACOSX' in filename or filename.startswith('.'):
+                logger.debug(f"Skipping system file: {filename}")
+                continue
+            
+            # Игнорируем директории
+            if filename.endswith('/'):
+                logger.debug(f"Skipping directory: {filename}")
+                continue
+            
+            # Проверяем расширение файла
+            if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')):
+                # Получаем только имя файла без пути
+                base_filename = filename.split('/')[-1]
+                logger.info(f"Extracting image: {filename} -> {base_filename}")
+                images.append((base_filename, zip_file.read(filename)))
+            else:
+                logger.debug(f"Skipping non-image file: {filename}")
+        
+        logger.info(f"Extracted {len(images)} images from ZIP")
+    return images
+
+async def extract_images_from_archive(archive_data: bytes, filename: str) -> list:
+    """Extract images from ZIP or RAR archive"""
+    filename_lower = filename.lower()
+    
+    if filename_lower.endswith('.zip'):
+        return await extract_images_from_archive(archive_data)
+    elif filename_lower.endswith('.rar'):
+        return await extract_images_from_rar(archive_data)
+    else:
+        logger.error(f"Unsupported archive format: {filename}")
+        return []
+
+async def extract_images_from_rar(rar_data: bytes) -> list:
+    """Extract images from RAR file, returns list of (filename, bytes)"""
+    images = []
+    try:
+        with rarfile.RarFile(BytesIO(rar_data), 'r') as rar_file:
+            all_files = rar_file.namelist()
+            logger.info(f"RAR contains {len(all_files)} files: {all_files[:10]}...")
+            
+            for filename in all_files:
+                # Игнорируем служебные папки и скрытые файлы
+                if '__MACOSX' in filename or filename.startswith('.'):
+                    logger.debug(f"Skipping system file: {filename}")
+                    continue
+                
+                # Игнорируем директории
+                if filename.endswith('/'):
+                    logger.debug(f"Skipping directory: {filename}")
+                    continue
+                
+                # Проверяем расширение файла
+                if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')):
+                    # Получаем только имя файла без пути
+                    base_filename = filename.split('/')[-1]
+                    logger.info(f"Extracting image: {filename} -> {base_filename}")
+                    images.append((base_filename, rar_file.read(filename)))
+                else:
+                    logger.debug(f"Skipping non-image file: {filename}")
+            
+            logger.info(f"Extracted {len(images)} images from RAR")
+    except Exception as e:
+        logger.error(f"Failed to extract RAR: {str(e)}")
+    
     return images
 
 def extract_audio_from_video(video_path: str, audio_path: str):
@@ -401,8 +489,10 @@ async def start_mode_photos(callback: CallbackQuery, state: FSMContext):
     """Start with photo upload and image generation"""
     await callback.message.edit_text(
         "📸 <b>Generate images from photos</b>\n\n"
-        "Please send me your source photos.\n"
-        "You can send multiple photos.\n\n"
+        "Please send me your source images:\n"
+        "• 📎 Send as <b>FILES/DOCUMENTS</b> (recommended for best quality)\n"
+        "• 🖼️ Or send as compressed photos\n"
+        "• 📦 Or upload ZIP/RAR archive\n\n"
         "When you're done, type /done",
         parse_mode="HTML"
     )
@@ -416,8 +506,9 @@ async def start_mode_video(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         "🎬 <b>Generate videos from existing images</b>\n\n"
         "Please upload your images:\n"
-        "• Upload a ZIP file with images, OR\n"
-        "• Send individual photos (one or multiple)\n\n"
+        "• 📎 Send as <b>FILES/DOCUMENTS</b> (best quality)\n"
+        "• 📦 Upload ZIP/RAR archive\n"
+        "• 🖼️ Or send as compressed photos\n\n"
         "When you're done, type /done",
         parse_mode="HTML"
     )
@@ -455,18 +546,106 @@ async def cmd_cancel(message: Message, state: FSMContext):
     await message.answer("❌ Operation cancelled. Use /start to begin again.")
 
 # ================== Photo Collection ==================
-@dp.message(BotStates.waiting_photos, F.photo)
+@dp.message(BotStates.waiting_photos, F.photo | F.document)
 async def receive_photo(message: Message, state: FSMContext):
-    """Receive photos from user"""
+    """Receive photos/images from user (as files for best quality)"""
     data = await state.get_data()
     photos = data.get("source_photos", [])
 
-    # Get the largest photo size
-    photo = message.photo[-1]
-    photos.append(photo.file_id)
+    # Check if it's a photo sent as compressed or as document
+    if message.photo:
+        # Compressed photo - download it but warn user
+        photo = message.photo[-1]
+        photos.append(photo.file_id)
+        await state.update_data(source_photos=photos)
+        await message.answer(
+            f"✅ Photo {len(photos)} received.\n"
+            f"⚠️ Tip: Send photos as <b>files/documents</b> (not compressed) for best quality!\n"
+            f"Send more or type /done to continue.",
+            parse_mode="HTML"
+        )
+    elif message.document:
+        # Check if it's an image file
+        filename = message.document.file_name.lower()
+        
+        # Check if it's an archive
+        if filename.endswith('.zip') or filename.endswith('.rar'):
+            await receive_photo_archive(message, state)
+            return
+        
+        # Check if it's an image
+        if filename.endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')):
+            photos.append(message.document.file_id)
+            await state.update_data(source_photos=photos)
+            await message.answer(f"✅ Image file {len(photos)} received (uncompressed quality). Send more or type /done to continue.")
+        else:
+            await message.answer("❌ Please send image files (.png, .jpg, .jpeg, .webp, .gif) or archives (.zip, .rar).")
 
-    await state.update_data(source_photos=photos)
-    await message.answer(f"✅ Photo {len(photos)} received. Send more or type /done to continue.")
+@dp.message(BotStates.waiting_photos, F.document)
+async def receive_photo_archive(message: Message, state: FSMContext):
+    """Receive archive with photos from user"""
+    filename = message.document.file_name.lower()
+    
+    # Проверяем расширение
+    if not (filename.endswith('.zip') or filename.endswith('.rar')):
+        await message.answer("❌ Please upload a ZIP or RAR archive with photos, or send photos directly.")
+        return
+    
+    await message.answer("📦 Extracting images from archive...")
+    
+    # Download archive
+    file = await bot.get_file(message.document.file_id)
+    archive_data = BytesIO()
+    await bot.download_file(file.file_path, archive_data)
+    
+    # Extract images
+    images = await extract_images_from_archive(archive_data.getvalue(), message.document.file_name)
+    
+    if not images:
+        await message.answer("❌ No images found in archive. Please upload a valid archive with images.")
+        return
+    
+    # Convert extracted images to temporary files and get their file_ids
+    # Since we can't directly use file_id from archive, we need to upload them back
+    data = await state.get_data()
+    photos = data.get("source_photos", [])
+    
+    temp_dir = Path("temp_archive_photos")
+    temp_dir.mkdir(exist_ok=True)
+    
+    try:
+        for idx, (img_filename, img_data) in enumerate(images):
+            # Save temporarily
+            temp_path = temp_dir / f"archive_{len(photos) + idx}_{img_filename}"
+            with open(temp_path, 'wb') as f:
+                f.write(img_data)
+            
+            # Upload to Telegram to get file_id
+            with open(temp_path, 'rb') as f:
+                sent_msg = await message.answer_photo(
+                    photo=BufferedInputFile(img_data, filename=img_filename),
+                    caption=f"📸 {idx + 1}/{len(images)}: {img_filename}"
+                )
+                photos.append(sent_msg.photo[-1].file_id)
+        
+        await state.update_data(source_photos=photos)
+        await message.answer(
+            f"✅ Archive processed! Added <b>{len(images)}</b> photos.\n"
+            f"Total: <b>{len(photos)}</b> photos.\n\n"
+            f"Send more photos/archives or type /done to continue.",
+            parse_mode="HTML"
+        )
+    finally:
+        # Cleanup
+        for file in temp_dir.glob("*"):
+            try:
+                file.unlink()
+            except:
+                pass
+        try:
+            temp_dir.rmdir()
+        except:
+            pass
 
 @dp.message(BotStates.waiting_photos, Command("done"))
 async def photos_done(message: Message, state: FSMContext):
@@ -708,21 +887,22 @@ async def request_corrected_zip(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(BotStates.waiting_zip_confirmation, F.document)
 async def receive_corrected_zip(message: Message, state: FSMContext):
-    """Receive corrected ZIP from user"""
-    if not message.document.file_name.endswith('.zip'):
-        await message.answer("❌ Please upload a ZIP file.")
+    """Receive corrected archive (ZIP or RAR) from user"""
+    filename = message.document.file_name.lower()
+    if not (filename.endswith('.zip') or filename.endswith('.rar')):
+        await message.answer("❌ Please upload a ZIP or RAR archive.")
         return
 
-    # Download ZIP
+    # Download archive
     file = await bot.get_file(message.document.file_id)
-    zip_data = BytesIO()
-    await bot.download_file(file.file_path, zip_data)
+    archive_data = BytesIO()
+    await bot.download_file(file.file_path, archive_data)
 
     # Extract images
-    images = await extract_images_from_zip(zip_data.getvalue())
+    images = await extract_images_from_archive(archive_data.getvalue(), message.document.file_name)
 
     if not images:
-        await message.answer("❌ No images found in ZIP. Please upload a valid ZIP with images.")
+        await message.answer("❌ No images found in archive. Please upload a valid archive with images.")
         return
 
     await state.update_data(generated_images=images)
@@ -734,30 +914,53 @@ async def receive_corrected_zip(message: Message, state: FSMContext):
     )
     await state.set_state(BotStates.choosing_num_videos)
 
-@dp.message(BotStates.waiting_video_zip, F.photo)
+@dp.message(BotStates.waiting_video_zip, F.photo | F.document)
 async def receive_video_photo(message: Message, state: FSMContext):
-    """Receive individual photos for video generation"""
+    """Receive individual photos/images for video generation (best quality as files)"""
     data = await state.get_data()
     video_images = data.get("video_images", [])
 
-    # Download photo
-    photo = message.photo[-1]
-    file = await bot.get_file(photo.file_id)
-    photo_data = BytesIO()
-    await bot.download_file(file.file_path, photo_data)
-
-    # Add to collection
-    filename = f"image_{len(video_images)}.jpg"
-    video_images.append((filename, photo_data.getvalue()))
-
-    await state.update_data(video_images=video_images)
-    await message.answer(f"✅ Photo {len(video_images)} received. Send more or type /done to continue.")
+    # Check if it's a photo or document
+    if message.photo:
+        # Compressed photo
+        photo = message.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        photo_data = BytesIO()
+        await bot.download_file(file.file_path, photo_data)
+        filename = f"image_{len(video_images)}.jpg"
+        video_images.append((filename, photo_data.getvalue()))
+        await state.update_data(video_images=video_images)
+        await message.answer(
+            f"✅ Photo {len(video_images)} received.\n"
+            f"⚠️ Tip: Send as <b>file/document</b> for best quality!",
+            parse_mode="HTML"
+        )
+    elif message.document:
+        filename = message.document.file_name.lower()
+        
+        # Check if archive
+        if filename.endswith('.zip') or filename.endswith('.rar'):
+            await receive_video_zip(message, state)
+            return
+        
+        # Check if image
+        if filename.endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')):
+            file = await bot.get_file(message.document.file_id)
+            photo_data = BytesIO()
+            await bot.download_file(file.file_path, photo_data)
+            video_images.append((message.document.file_name, photo_data.getvalue()))
+            await state.update_data(video_images=video_images)
+            await message.answer(f"✅ Image file {len(video_images)} received (uncompressed). Send more or type /done to continue.")
+        else:
+            await message.answer("❌ Please send image files or archives.")
 
 @dp.message(BotStates.waiting_video_zip, F.document)
 async def receive_video_zip(message: Message, state: FSMContext):
     """Receive ZIP with images for video generation"""
-    if not message.document.file_name.endswith('.zip'):
-        await message.answer("❌ Please upload a ZIP file or send photos directly.")
+    # Проверяем расширение архива
+    filename = message.document.file_name.lower()
+    if not (filename.endswith('.zip') or filename.endswith('.rar')):
+        await message.answer("❌ Please upload a ZIP or RAR archive, or send photos directly.")
         return
 
     data = await state.get_data()
@@ -768,17 +971,17 @@ async def receive_video_zip(message: Message, state: FSMContext):
     zip_data = BytesIO()
     await bot.download_file(file.file_path, zip_data)
 
-    # Extract images
-    images_from_zip = await extract_images_from_zip(zip_data.getvalue())
+    # Extract images from archive
+    images_from_archive = await extract_images_from_archive(zip_data.getvalue(), message.document.file_name)
 
-    if not images_from_zip:
+    if not images_from_archive:
         await message.answer("❌ No images found in ZIP. Please upload a valid ZIP with images.")
         return
 
     # Merge with existing images
-    video_images.extend(images_from_zip)
+    video_images.extend(images_from_archive)
     await state.update_data(video_images=video_images)
-    await message.answer(f"✅ ZIP received! Added {len(images_from_zip)} images. Total: {len(video_images)} images.\n\nSend more or type /done to continue.")
+    await message.answer(f"✅ ZIP received! Added {len(images_from_archive)} images. Total: {len(video_images)} images.\n\nSend more or type /done to continue.")
 
 @dp.message(BotStates.waiting_video_zip, Command("done"))
 async def video_images_done(message: Message, state: FSMContext):
@@ -970,8 +1173,9 @@ async def lipsync_mode_video(callback: CallbackQuery, state: FSMContext):
     """Start lip-sync from video mode"""
     await callback.message.edit_text(
         "🎬 <b>Lip-sync from Video</b>\n\n"
-        "Please send me your video(s).\n"
-        "You can send multiple videos.\n\n"
+        "Please send me your video(s):\n"
+        "• 📎 Send as <b>FILES/DOCUMENTS</b> (recommended)\n"
+        "• 🎥 Or send as compressed video\n\n"
         "When you're done, type /done",
         parse_mode="HTML"
     )
@@ -979,15 +1183,31 @@ async def lipsync_mode_video(callback: CallbackQuery, state: FSMContext):
     await state.update_data(lipsync_videos=[])
     await callback.answer()
 
-@dp.message(BotStates.waiting_lipsync_videos, F.video)
+@dp.message(BotStates.waiting_lipsync_videos, F.video | F.document)
 async def receive_lipsync_video(message: Message, state: FSMContext):
-    """Receive videos for lip-sync"""
+    """Receive videos for lip-sync (best quality as files)"""
     data = await state.get_data()
     videos = data.get("lipsync_videos", [])
     
-    videos.append(message.video.file_id)
-    await state.update_data(lipsync_videos=videos)
-    await message.answer(f"✅ Video {len(videos)} received. Send more or type /done to continue.")
+    if message.video:
+        # Compressed video
+        videos.append(message.video.file_id)
+        await state.update_data(lipsync_videos=videos)
+        await message.answer(
+            f"✅ Video {len(videos)} received.\n"
+            f"⚠️ Tip: Send as <b>file/document</b> for best quality!\n"
+            f"Send more or type /done to continue.",
+            parse_mode="HTML"
+        )
+    elif message.document:
+        filename = message.document.file_name.lower()
+        # Check if it's a video file
+        if filename.endswith(('.mp4', '.mov', '.avi', '.mkv', '.webm')):
+            videos.append(message.document.file_id)
+            await state.update_data(lipsync_videos=videos)
+            await message.answer(f"✅ Video file {len(videos)} received (uncompressed). Send more or type /done to continue.")
+        else:
+            await message.answer("❌ Please send video files (.mp4, .mov, .avi, .mkv, .webm).")
 
 @dp.message(BotStates.waiting_lipsync_videos, Command("done"))
 async def lipsync_videos_done(message: Message, state: FSMContext):
@@ -1169,8 +1389,9 @@ async def lipsync_mode_image(callback: CallbackQuery, state: FSMContext):
     """Start lip-sync from image mode"""
     await callback.message.edit_text(
         "📸 <b>Create Lip-sync from Image</b>\n\n"
-        "Please send me your image(s).\n"
-        "You can send multiple images.\n\n"
+        "Please send me your image(s):\n"
+        "• 📎 Send as <b>FILES/DOCUMENTS</b> (best quality)\n"
+        "• 🖼️ Or send as compressed photos\n\n"
         "When you're done, type /done",
         parse_mode="HTML"
     )
@@ -1178,23 +1399,38 @@ async def lipsync_mode_image(callback: CallbackQuery, state: FSMContext):
     await state.update_data(lipsync_images=[])
     await callback.answer()
 
-@dp.message(BotStates.waiting_lipsync_images, F.photo)
+@dp.message(BotStates.waiting_lipsync_images, F.photo | F.document)
 async def receive_lipsync_image(message: Message, state: FSMContext):
-    """Receive images for lip-sync video generation"""
+    """Receive images for lip-sync video generation (best quality as files)"""
     data = await state.get_data()
     images = data.get("lipsync_images", [])
     
-    # Download image
-    photo = message.photo[-1]
-    file = await bot.get_file(photo.file_id)
-    photo_data = BytesIO()
-    await bot.download_file(file.file_path, photo_data)
-    
-    filename = f"image_{len(images)}.jpg"
-    images.append((filename, photo_data.getvalue()))
-    
-    await state.update_data(lipsync_images=images)
-    await message.answer(f"✅ Image {len(images)} received. Send more or type /done to continue.")
+    if message.photo:
+        # Compressed photo
+        photo = message.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        photo_data = BytesIO()
+        await bot.download_file(file.file_path, photo_data)
+        filename = f"image_{len(images)}.jpg"
+        images.append((filename, photo_data.getvalue()))
+        await state.update_data(lipsync_images=images)
+        await message.answer(
+            f"✅ Image {len(images)} received.\n"
+            f"⚠️ Tip: Send as <b>file/document</b> for best quality!\n"
+            f"Send more or type /done to continue.",
+            parse_mode="HTML"
+        )
+    elif message.document:
+        filename = message.document.file_name.lower()
+        if filename.endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')):
+            file = await bot.get_file(message.document.file_id)
+            photo_data = BytesIO()
+            await bot.download_file(file.file_path, photo_data)
+            images.append((message.document.file_name, photo_data.getvalue()))
+            await state.update_data(lipsync_images=images)
+            await message.answer(f"✅ Image file {len(images)} received (uncompressed). Send more or type /done to continue.")
+        else:
+            await message.answer("❌ Please send image files.")
 
 @dp.message(BotStates.waiting_lipsync_images, Command("done"))
 async def lipsync_images_done(message: Message, state: FSMContext):

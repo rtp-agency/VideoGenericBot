@@ -64,3 +64,4 @@ urllib3==2.6.2
 wcwidth==0.2.14
 websockets==15.0.1
 yarl==1.22.0
+rarfile==4.2
